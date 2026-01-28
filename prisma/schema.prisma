@@ -1,0 +1,117 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+  SUPERADMIN
+}
+
+model User {
+  id             BigInt   @id // Telegram ID
+  username       String?
+  firstName      String?
+  referralSource String?
+  role           Role     @default(USER)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  views     MovieView[]
+  ratings   Rating[]
+  feedbacks Feedback[]
+  requests  MovieRequest[]
+
+  @@map("users")
+}
+
+model Category {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  movies    Movie[]
+  createdAt DateTime @default(now())
+
+  @@map("categories")
+}
+
+model Movie {
+  id          Int      @id @default(autoincrement())
+  code        Int      @unique
+  title       String
+  description String?
+  fileId      String // Telegram file_id
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  category    Category? @relation(fields: [categoryId], references: [id])
+  categoryId  Int?
+
+  views     MovieView[]
+  ratings   Rating[]
+
+  @@index([title])
+  @@map("movies")
+}
+
+model Rating {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    BigInt
+  movie     Movie    @relation(fields: [movieId], references: [id])
+  movieId   Int
+  score     Int // 1 to 5
+  createdAt DateTime @default(now())
+
+  @@unique([userId, movieId])
+  @@map("ratings")
+}
+
+model MovieView {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    BigInt
+  movie     Movie    @relation(fields: [movieId], references: [id])
+  movieId   Int
+  createdAt DateTime @default(now())
+
+  @@unique([userId, movieId])
+  @@map("movie_views")
+}
+
+model Channel {
+  id         Int      @id @default(autoincrement())
+  channelId  BigInt   @unique
+  title      String
+  inviteLink String
+  createdAt  DateTime @default(now())
+
+  @@map("channels")
+}
+
+model Feedback {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    BigInt
+  message   String
+  isResolved Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("feedbacks")
+}
+
+model MovieRequest {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    BigInt
+  title     String
+  status    String   @default("PENDING") // PENDING, FULFILLED, REJECTED
+  createdAt DateTime @default(now())
+
+  @@index([status])
+  @@map("movie_requests")
+}
