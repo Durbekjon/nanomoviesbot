@@ -48,4 +48,4 @@ USER nestjs
 
 # Command to run the bot using dumb-init
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["npm", "run", "start:prod"]
+CMD ["sh", "-c", "npx prisma db push && npm run start:prod"]
