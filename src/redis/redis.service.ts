@@ -56,7 +56,9 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async setJson(key: string, value: any, ttlSeconds?: number): Promise<void> {
-    const stringValue = JSON.stringify(value);
+    const stringValue = JSON.stringify(value, (_, v) =>
+      typeof v === 'bigint' ? v.toString() : v,
+    );
     if (ttlSeconds) {
       await this.redis.set(key, stringValue, 'EX', ttlSeconds);
     } else {

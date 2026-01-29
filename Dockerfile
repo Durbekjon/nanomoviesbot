@@ -44,6 +44,10 @@ RUN npx prisma generate
 
 # Create a non-root user
 RUN groupadd -r nodejs && useradd -r -g nodejs nestjs
+
+# Change ownership of the app directory
+RUN chown -R nestjs:nodejs /app
+
 USER nestjs
 
 # Command to run the bot using dumb-init
