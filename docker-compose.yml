@@ -1,15 +1,26 @@
-version: '3.8'
-
 services:
-  postgres:
+  bot:
+    build: .
+    container_name: moviebot_app
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}?schema=public
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    restart: always
+
+  db:
     image: postgres:15-alpine
     container_name: moviebot_postgres
+    env_file: .env
     environment:
-      POSTGRES_USER: ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASS:-postgres}
-      POSTGRES_DB: ${DB_NAME:-moviebot}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+      - POSTGRES_DB=${DB_NAME}
     ports:
-      - '${DB_PORT:-5432}:5432'
+      - '${DB_PORT}:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: always
@@ -18,7 +29,7 @@ services:
     image: redis:alpine
     container_name: moviebot_redis
     ports:
-      - '${REDIS_PORT:-6379}:6379'
+      - '${REDIS_PORT}:6379'
     volumes:
       - redis_data:/data
     restart: always

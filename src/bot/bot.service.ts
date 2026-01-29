@@ -14,7 +14,6 @@ import {
   HttpError,
 } from 'grammy';
 import { UsersService } from '../users/users.service';
-
 import { RedisService } from '../redis/redis.service';
 import { MoviesService } from '../movies/movies.service';
 import { FeedbackService } from '../feedback/feedback.service';
@@ -53,7 +52,29 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     this.logger.log('Initializing Bot...');
 
-    // Middleware: Channel Subscription Guard
+    this.registerMiddleware();
+    this.registerCommands();
+    this.registerAdminHandlers();
+    this.registerUserHandlers();
+    this.registerStateHandlers();
+
+    // Start
+    this.bot
+      .start({
+        onStart: (bot) => this.logger.log(`Bot started as @${bot.username}`),
+      })
+      .catch((err) => this.logger.error('Bot failed to start', err));
+  }
+
+  async onModuleDestroy() {
+    await this.bot.stop();
+  }
+
+  getBot(): Bot<Context> {
+    return this.bot;
+  }
+
+  private registerMiddleware() {
     this.bot.on('inline_query', async (ctx) => {
       const query = ctx.inlineQuery.query;
       const movies = await this.moviesService.findByTitle(query);
@@ -89,6 +110,88 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
+    this.bot.use(async (ctx, next) => {
+      if (!ctx.from) return next();
+      const userId = ctx.from.id;
+
+      if (this.superAdminIds.includes(userId.toString())) return next();
+
+      const user = await this.usersService.findById(userId);
+      if (user && (user.role === Role.ADMIN || user.role === Role.SUPERADMIN)) {
+        return next();
+      }
+
+      const cacheKey = `sub_status:${userId}`;
+      const isSubscribedCached = await this.redisService.get(cacheKey);
+      if (isSubscribedCached === 'true') return next();
+
+      const channels = await this.channelsService.findAll();
+      const notSubscribed: Channel[] = [];
+
+      for (const channel of channels) {
+        try {
+          const member = await ctx.api.getChatMember(
+            Number(channel.channelId),
+            userId,
+          );
+          if (member.status === 'left' || member.status === 'kicked') {
+            notSubscribed.push(channel);
+          }
+        } catch (e) {}
+      }
+
+      if (notSubscribed.length > 0) {
+        const keyboard = new InlineKeyboard();
+        notSubscribed.forEach((ch) => {
+          keyboard.url(ch.title, ch.inviteLink).row();
+        });
+        keyboard.text(MESSAGES.check_subscription_btn, 'check_subscription');
+
+        if (
+          ctx.callbackQuery &&
+          ctx.callbackQuery.data === 'check_subscription'
+        ) {
+          await ctx.answerCallbackQuery({
+            text: MESSAGES.not_subscribed_all,
+            show_alert: true,
+          });
+          return;
+        }
+
+        if (ctx.message || ctx.callbackQuery) {
+          const msg = MESSAGES.must_subscribe;
+          if (ctx.message) {
+            await ctx.reply(msg, { reply_markup: keyboard });
+          } else if (ctx.callbackQuery) {
+            await ctx.answerCallbackQuery({
+              text: MESSAGES.subscribe_first,
+              show_alert: true,
+            });
+            await ctx.reply(msg, { reply_markup: keyboard });
+          }
+        }
+        return;
+      }
+
+      await this.redisService.set(cacheKey, 'true', 300);
+
+      if (
+        ctx.callbackQuery &&
+        ctx.callbackQuery.data === 'check_subscription'
+      ) {
+        await ctx.answerCallbackQuery({ text: MESSAGES.access_granted });
+        try {
+          await ctx.deleteMessage();
+        } catch (e) {}
+        await ctx.reply(MESSAGES.welcome_back);
+        return;
+      }
+
+      await next();
+    });
+  }
+
+  private registerCommands() {
     this.bot.hears(/^\/fulfill_(\d+)$/, async (ctx) => {
       const id = parseInt(ctx.match[1]);
       const request = await this.movieRequestsService.updateStatus(
@@ -113,88 +216,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.reply(`❌ Request for "${request.title}" marked as REJECTED.`);
     });
 
-    this.bot.use(async (ctx, next) => {
-      if (!ctx.from) return next();
-
-      // Allow specific updates to pass through (like callbacks for check, or if user is admin)
-      if (this.superAdminIds.includes(ctx.from.id.toString())) return next();
-
-      // Also check DB role
-      const user = await this.usersService.findById(ctx.from.id);
-      if (user && (user.role === Role.ADMIN || user.role === Role.SUPERADMIN))
-        return next();
-
-      // Check subscription
-      const channels = await this.channelsService.findAll();
-      const notSubscribed: Channel[] = [];
-
-      for (const channel of channels) {
-        try {
-          const member = await ctx.api.getChatMember(
-            Number(channel.channelId),
-            ctx.from.id,
-          );
-          if (member.status === 'left' || member.status === 'kicked') {
-            notSubscribed.push(channel);
-          }
-        } catch (e) {
-          // If bot is not admin in channel or channel is invalid, ignore for now to avoid locking users out
-          // or log it.
-        }
-      }
-
-      if (notSubscribed.length > 0) {
-        const keyboard = new InlineKeyboard();
-        notSubscribed.forEach((ch) => {
-          keyboard.url(ch.title, ch.inviteLink).row();
-        });
-        keyboard.text(MESSAGES.check_subscription_btn, 'check_subscription');
-
-        if (
-          ctx.callbackQuery &&
-          ctx.callbackQuery.data === 'check_subscription'
-        ) {
-          await ctx.answerCallbackQuery({
-            text: MESSAGES.not_subscribed_all,
-            show_alert: true,
-          });
-          return;
-        }
-
-        if (ctx.message || ctx.callbackQuery) {
-          if (ctx.message) {
-            await ctx.reply(MESSAGES.must_subscribe, {
-              reply_markup: keyboard,
-            });
-          } else if (ctx.callbackQuery) {
-            await ctx.answerCallbackQuery({
-              text: MESSAGES.subscribe_first,
-              show_alert: true,
-            });
-            await ctx.reply(MESSAGES.must_subscribe, {
-              reply_markup: keyboard,
-            });
-          }
-        }
-        return; // Stop propagation
-      }
-
-      if (
-        ctx.callbackQuery &&
-        ctx.callbackQuery.data === 'check_subscription'
-      ) {
-        await ctx.answerCallbackQuery({ text: MESSAGES.access_granted });
-        try {
-          await ctx.deleteMessage();
-        } catch (e) {}
-        await ctx.reply(MESSAGES.welcome_back);
-        return;
-      }
-
-      await next();
-    });
-
-    // Command: Start
     this.bot.command('start', async (ctx) => {
       const { id, first_name, username } = ctx.from!;
       const referralPayload = ctx.match;
@@ -214,7 +235,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await this.redisService.set(`state:${id}`, 'IDLE');
 
       if (ctx.match?.startsWith('movie_')) {
-        // Handle deep link for specific movie
         const code = parseInt(ctx.match.split('_')[1]);
         const movie = await this.moviesService.findByCode(code);
         if (movie) {
@@ -236,7 +256,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      // Check if Admin (Superadmin env OR DB Admin)
       const isSuperAdmin = this.superAdminIds.includes(id.toString());
       const isAdmin =
         user.role === Role.ADMIN ||
@@ -256,15 +275,15 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         .text(MESSAGES.contact_feedback_btn, 'feedback')
         .row();
 
-      const logoPath = path.join(__dirname, 'static', 'logo.png');
+      const logoPath = path.join(__dirname, '..', '..', 'static', 'logo.png');
       await ctx.replyWithPhoto(new InputFile(logoPath), {
         caption: MESSAGES.welcome(first_name),
         reply_markup: keyboard,
       });
     });
+  }
 
-    // --- ADMIN HANDLERS ---
-
+  private registerAdminHandlers() {
     this.bot.callbackQuery('admin_panel', async (ctx) => {
       await this.sendAdminPanel(ctx, true);
     });
@@ -284,7 +303,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       const logoPath = path.join(__dirname, '..', '..', 'static', 'logo.png');
       await ctx.replyWithPhoto(new InputFile(logoPath), {
-        caption: MESSAGES.welcome_user_mode(ctx.from.first_name),
+        caption: MESSAGES.welcome_user_mode(ctx.from!.first_name),
         reply_markup: keyboard,
       });
       await ctx.answerCallbackQuery();
@@ -323,24 +342,24 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery();
     });
 
-    // Add Movie
     this.bot.callbackQuery('admin_add_movie', async (ctx) => {
       await this.redisService.set(
-        `state:${ctx.from.id}`,
+        `state:${ctx.from!.id}`,
         'WAITING_MOVIE_UPLOAD',
       );
       await ctx.reply(MESSAGES.ask_movie_file);
       await ctx.answerCallbackQuery();
     });
 
-    // Add Channel
     this.bot.callbackQuery('admin_add_channel', async (ctx) => {
-      await this.redisService.set(`state:${ctx.from.id}`, 'WAITING_CHANNEL_ID');
+      await this.redisService.set(
+        `state:${ctx.from!.id}`,
+        'WAITING_CHANNEL_ID',
+      );
       await ctx.reply(MESSAGES.ask_channel_id);
       await ctx.answerCallbackQuery();
     });
 
-    // Feedbacks
     this.bot.callbackQuery('admin_feedbacks', async (ctx) => {
       const feedbacks = await this.feedbackService.findAllUnresolved();
       if (feedbacks.length === 0) {
@@ -351,7 +370,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       await ctx.answerCallbackQuery();
       for (const fb of feedbacks.slice(0, 10)) {
-        // Show last 10
         const keyboard = new InlineKeyboard()
           .text(MESSAGES.resolve_btn, `resolve_feedback_${fb.id}`)
           .text(MESSAGES.delete_btn, `delete_feedback_${fb.id}`)
@@ -378,33 +396,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       });
     });
 
-    this.bot.on('callback_query:data', async (ctx, next) => {
-      const data = ctx.callbackQuery.data;
-      if (data.startsWith('resolve_feedback_')) {
-        const id = parseInt(data.replace('resolve_feedback_', ''));
-        await this.feedbackService.resolve(id);
-        await ctx.answerCallbackQuery(MESSAGES.marked_resolved);
-        try {
-          await ctx.editMessageText(
-            ctx.callbackQuery.message!.text + MESSAGES.resolved_status,
-            { parse_mode: 'Markdown' },
-          );
-        } catch (e: any) {
-          if (!e.description?.includes('message is not modified')) throw e;
-        }
-      } else if (data.startsWith('delete_feedback_')) {
-        const id = parseInt(data.replace('delete_feedback_', ''));
-        await this.feedbackService.delete(id);
-        await ctx.answerCallbackQuery(MESSAGES.deleted_feedback);
-        try {
-          await ctx.deleteMessage();
-        } catch (e) {}
-      } else {
-        return next();
-      }
-    });
-
-    // Manage Channels
     this.bot.callbackQuery('admin_manage_channels', async (ctx) => {
       const channels = await this.channelsService.findAll();
       const keyboard = new InlineKeyboard()
@@ -420,7 +411,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.answerCallbackQuery();
     });
 
-    // Manage Movies
     this.bot.callbackQuery('admin_manage_movies', async (ctx) => {
       const keyboard = new InlineKeyboard()
         .text(MESSAGES.add_movie_btn, 'admin_add_movie')
@@ -435,16 +425,15 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     this.bot.callbackQuery('admin_manage_movie_by_code', async (ctx) => {
       await this.redisService.set(
-        `state:${ctx.from.id}`,
+        `state:${ctx.from!.id}`,
         'WAITING_MOVIE_EDIT_CODE',
       );
       await ctx.reply(MESSAGES.ask_movie_code_manage);
       await ctx.answerCallbackQuery();
     });
 
-    // Manage Admins (Superadmin Only)
     this.bot.callbackQuery(/^admin_manage_admins(_\d+)?$/, async (ctx) => {
-      if (!this.superAdminIds.includes(ctx.from.id.toString())) {
+      if (!this.superAdminIds.includes(ctx.from!.id.toString())) {
         await ctx.answerCallbackQuery(MESSAGES.unauthorized);
         return;
       }
@@ -466,7 +455,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         keyboard.text(label, `manage_admin_${admin.id}`).row();
       });
 
-      // Pagination row
       if (page > 0) {
         keyboard.text('⬅️ Prev', `admin_manage_admins_${page - 1}`);
       }
@@ -480,7 +468,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await this.safeEditMessage(ctx, MESSAGES.manage_admins_title, keyboard);
       await ctx.answerCallbackQuery();
     });
-    // Manage Categories
+
     this.bot.callbackQuery('admin_manage_categories', async (ctx) => {
       const categories = await this.moviesService.getAllCategories();
       const keyboard = new InlineKeyboard()
@@ -501,7 +489,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     this.bot.callbackQuery('admin_add_category', async (ctx) => {
       await this.redisService.set(
-        `state:${ctx.from.id}`,
+        `state:${ctx.from!.id}`,
         'WAITING_CATEGORY_NAME',
       );
       await ctx.reply('Iltimos, yangi janr nomini yuboring:');
@@ -509,10 +497,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery(/^delete_cat_(\d+)$/, async (ctx) => {
-      const id = parseInt(ctx.match[1]);
+      const id = parseInt(ctx.match![1]);
       await this.moviesService.deleteCategory(id);
       await ctx.answerCallbackQuery("Janr o'chirildi.");
-      // Refresh list
       const categories = await this.moviesService.getAllCategories();
       const keyboard = new InlineKeyboard()
         .text("➕ Janr qo'shish", 'admin_add_category')
@@ -528,7 +515,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery(/^manage_admin_(\d+)$/, async (ctx) => {
-      const adminId = BigInt(ctx.match[1]);
+      const adminId = BigInt(ctx.match![1]);
       const admin = await this.usersService.findById(adminId);
 
       if (!admin) {
@@ -537,7 +524,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       }
 
       await this.redisService.set(
-        `temp_edit_admin:${ctx.from.id}`,
+        `temp_edit_admin:${ctx.from!.id}`,
         admin.id.toString(),
       );
 
@@ -558,13 +545,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery('delete_admin_access', async (ctx) => {
-      if (!this.superAdminIds.includes(ctx.from.id.toString())) {
+      if (!this.superAdminIds.includes(ctx.from!.id.toString())) {
         await ctx.answerCallbackQuery(MESSAGES.unauthorized);
         return;
       }
 
       const adminIdStr = await this.redisService.get(
-        `temp_edit_admin:${ctx.from.id}`,
+        `temp_edit_admin:${ctx.from!.id}`,
       );
       if (!adminIdStr) {
         await ctx.answerCallbackQuery(
@@ -581,11 +568,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await this.usersService.setRole(BigInt(adminIdStr), Role.USER);
       await ctx.answerCallbackQuery(MESSAGES.access_removed);
       await ctx.reply(MESSAGES.access_removed_for(adminIdStr));
-      await this.redisService.del(`temp_edit_admin:${ctx.from.id}`);
+      await this.redisService.del(`temp_edit_admin:${ctx.from!.id}`);
       await this.sendAdminPanel(ctx);
     });
 
-    // List Users
     this.bot.callbackQuery('admin_list_users', async (ctx) => {
       await ctx.reply(MESSAGES.generating_user_list);
       const users = await this.usersService.findAll();
@@ -599,126 +585,37 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           )
           .join('\n');
 
-      const filePath = path.join(__dirname, 'users_export.csv');
+      const filePath = path.join(
+        __dirname,
+        '..',
+        '..',
+        'static',
+        'users_export.csv',
+      );
       fs.writeFileSync(filePath, csvContent);
 
       await ctx.replyWithDocument(new InputFile(filePath));
-      fs.unlinkSync(filePath); // Cleanup
+      fs.unlinkSync(filePath);
       await ctx.answerCallbackQuery();
     });
 
-    // Make Admin
     this.bot.callbackQuery('admin_make_admin', async (ctx) => {
-      if (!this.superAdminIds.includes(ctx.from.id.toString())) {
+      if (!this.superAdminIds.includes(ctx.from!.id.toString())) {
         await ctx.answerCallbackQuery(MESSAGES.unauthorized);
         return;
       }
-      await this.redisService.set(`state:${ctx.from.id}`, 'WAITING_PROMOTE_ID');
+      await this.redisService.set(
+        `state:${ctx.from!.id}`,
+        'WAITING_PROMOTE_ID',
+      );
       await ctx.reply(MESSAGES.ask_promote_id);
       await ctx.answerCallbackQuery();
     });
+  }
 
-    // General Callback for managing specific channel
-    this.bot.on('callback_query:data', async (ctx, next) => {
-      const data = ctx.callbackQuery.data;
-      if (data.startsWith('manage_channel_')) {
-        const channelId = parseInt(data.replace('manage_channel_', ''));
-        const channel = await this.channelsService.findById(channelId);
-        if (!channel) {
-          await ctx.answerCallbackQuery(
-            MESSAGES.channel_not_found || 'Channel not found.',
-          );
-          return;
-        }
-
-        await this.redisService.set(
-          `temp_edit_channel:${ctx.from.id}`,
-          channelId.toString(),
-        );
-
-        const keyboard = new InlineKeyboard()
-          .text(MESSAGES.edit_title_btn, 'edit_channel_title')
-          .text(MESSAGES.edit_link_btn, 'edit_channel_link')
-          .row()
-          .text(MESSAGES.delete_channel_btn, 'delete_channel')
-          .row()
-          .text(MESSAGES.back, 'admin_manage_channels');
-
-        const text = MESSAGES.channel_detail(
-          channel.title,
-          channel.channelId.toString(),
-          channel.inviteLink,
-        );
-
-        await this.safeEditMessage(ctx, text, keyboard);
-        await ctx.answerCallbackQuery();
-      } else if (data === 'edit_channel_title') {
-        const channelIdStr = await this.redisService.get(
-          `temp_edit_channel:${ctx.from.id}`,
-        );
-        if (channelIdStr) {
-          await this.redisService.set(
-            `state:${ctx.from.id}`,
-            'WAITING_EDIT_CHANNEL_TITLE',
-          );
-          await ctx.reply(MESSAGES.ask_new_channel_title);
-        }
-        await ctx.answerCallbackQuery();
-      } else if (data === 'edit_channel_link') {
-        const channelIdStr = await this.redisService.get(
-          `temp_edit_channel:${ctx.from.id}`,
-        );
-        if (channelIdStr) {
-          await this.redisService.set(
-            `state:${ctx.from.id}`,
-            'WAITING_EDIT_CHANNEL_LINK',
-          );
-          await ctx.reply(MESSAGES.ask_new_channel_link);
-        }
-        await ctx.answerCallbackQuery();
-      } else if (data === 'delete_channel') {
-        const channelIdStr = await this.redisService.get(
-          `temp_edit_channel:${ctx.from.id}`,
-        );
-        if (channelIdStr) {
-          await this.channelsService.delete(parseInt(channelIdStr));
-          await ctx.reply(MESSAGES.channel_deleted);
-          await this.redisService.del(`temp_edit_channel:${ctx.from.id}`);
-          await this.sendAdminPanel(ctx); // Go back to Home
-        }
-        await ctx.answerCallbackQuery();
-      } else if (data === 'edit_movie_title') {
-        const movieIdStr = await this.redisService.get(
-          `temp_edit_movie:${ctx.from.id}`,
-        );
-        if (movieIdStr) {
-          await this.redisService.set(
-            `state:${ctx.from.id}`,
-            'WAITING_EDIT_MOVIE_TITLE',
-          );
-          await ctx.reply(MESSAGES.ask_new_movie_title);
-        }
-        await ctx.answerCallbackQuery();
-      } else if (data === 'delete_movie') {
-        const movieIdStr = await this.redisService.get(
-          `temp_edit_movie:${ctx.from.id}`,
-        );
-        if (movieIdStr) {
-          await this.moviesService.delete(parseInt(movieIdStr));
-          await ctx.reply(MESSAGES.movie_deleted);
-          await this.redisService.del(`temp_edit_movie:${ctx.from.id}`);
-          await this.sendAdminPanel(ctx);
-        }
-        await ctx.answerCallbackQuery();
-      } else {
-        return next();
-      }
-    });
-
-    // --- USER HANDLERS ---
-
+  private registerUserHandlers() {
     this.bot.callbackQuery('feedback', async (ctx) => {
-      await this.redisService.set(`state:${ctx.from.id}`, 'WAITING_FEEDBACK');
+      await this.redisService.set(`state:${ctx.from!.id}`, 'WAITING_FEEDBACK');
       await ctx.reply(MESSAGES.ask_feedback);
       await ctx.answerCallbackQuery();
     });
@@ -729,7 +626,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         await ctx.answerCallbackQuery(MESSAGES.no_movies);
         return;
       }
-      await this.moviesService.addView(BigInt(ctx.from.id), movie.id);
+      await this.moviesService.addView(BigInt(ctx.from!.id), movie.id);
       const avgRating = await this.moviesService.getAverageRating(movie.id);
 
       const keyboard = new InlineKeyboard();
@@ -749,12 +646,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery(/^rate_(\d+)_(\d+)$/, async (ctx) => {
-      const movieId = parseInt(ctx.match[1]);
-      const score = parseInt(ctx.match[2]);
-      await this.moviesService.addRating(BigInt(ctx.from.id), movieId, score);
+      const movieId = parseInt(ctx.match![1]);
+      const score = parseInt(ctx.match![2]);
+      await this.moviesService.addRating(BigInt(ctx.from!.id), movieId, score);
       await ctx.answerCallbackQuery(MESSAGES.rating_thanks);
 
-      // Optionally update the message with new average rating
       const avgRating = await this.moviesService.getAverageRating(movieId);
       const movie = await this.moviesService.findById(movieId);
       if (movie && ctx.callbackQuery.message) {
@@ -774,7 +670,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery('search_movie', async (ctx) => {
-      await this.redisService.set(`state:${ctx.from.id}`, 'WAITING_MOVIE_CODE');
+      await this.redisService.set(
+        `state:${ctx.from!.id}`,
+        'WAITING_MOVIE_CODE',
+      );
       await ctx.reply(MESSAGES.ask_movie_code);
       await ctx.answerCallbackQuery();
     });
@@ -795,14 +694,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery(/^cat_(\d+)$/, async (ctx) => {
-      const catId = parseInt(ctx.match[1]);
+      const catId = parseInt(ctx.match![1]);
       const movies = await this.moviesService.findByCategory(catId);
       if (movies.length === 0) {
         await ctx.answerCallbackQuery(MESSAGES.no_movies_in_category);
         return;
       }
 
-      // Show list of movies in category (pagination could be added later)
       let text = `🎬 *Movies*: \n\n`;
       const keyboard = new InlineKeyboard();
       movies.forEach((m) => {
@@ -833,25 +731,158 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     this.bot.callbackQuery('request_movie', async (ctx) => {
       await this.redisService.set(
-        `state:${ctx.from.id}`,
+        `state:${ctx.from!.id}`,
         'WAITING_REQUEST_TITLE',
       );
       await ctx.reply(MESSAGES.ask_request_title);
       await ctx.answerCallbackQuery();
     });
+  }
 
-    // --- MESSAGE HANDLERS ---
+  private registerStateHandlers() {
+    this.bot.on('callback_query:data', async (ctx, next) => {
+      const userId = ctx.from!.id;
+      const data = ctx.callbackQuery.data;
+
+      if (data.startsWith('resolve_feedback_')) {
+        const id = parseInt(data.replace('resolve_feedback_', ''));
+        await this.feedbackService.resolve(id);
+        await ctx.answerCallbackQuery(MESSAGES.marked_resolved);
+        try {
+          await ctx.editMessageText(
+            ctx.callbackQuery.message!.text + MESSAGES.resolved_status,
+            { parse_mode: 'Markdown' },
+          );
+        } catch (e: any) {
+          if (!e.description?.includes('message is not modified')) throw e;
+        }
+      } else if (data.startsWith('delete_feedback_')) {
+        const id = parseInt(data.replace('delete_feedback_', ''));
+        await this.feedbackService.delete(id);
+        await ctx.answerCallbackQuery(MESSAGES.deleted_feedback);
+        try {
+          await ctx.deleteMessage();
+        } catch (e) {}
+      } else if (data.startsWith('manage_channel_')) {
+        const channelId = parseInt(data.replace('manage_channel_', ''));
+        const channel = await this.channelsService.findById(channelId);
+        if (!channel) {
+          await ctx.answerCallbackQuery(
+            MESSAGES.channel_not_found || 'Channel not found.',
+          );
+          return;
+        }
+
+        await this.redisService.set(
+          `temp_edit_channel:${userId}`,
+          channelId.toString(),
+        );
+
+        const keyboard = new InlineKeyboard()
+          .text(MESSAGES.edit_title_btn, 'edit_channel_title')
+          .text(MESSAGES.edit_link_btn, 'edit_channel_link')
+          .row()
+          .text(MESSAGES.delete_channel_btn, 'delete_channel')
+          .row()
+          .text(MESSAGES.back, 'admin_manage_channels');
+
+        const text = MESSAGES.channel_detail(
+          channel.title,
+          channel.channelId.toString(),
+          channel.inviteLink,
+        );
+        await this.safeEditMessage(ctx, text, keyboard);
+        await ctx.answerCallbackQuery();
+      } else if (data === 'edit_channel_title') {
+        const channelIdStr = await this.redisService.get(
+          `temp_edit_channel:${userId}`,
+        );
+        if (channelIdStr) {
+          await this.redisService.set(
+            `state:${userId}`,
+            'WAITING_EDIT_CHANNEL_TITLE',
+          );
+          await ctx.reply(MESSAGES.ask_new_channel_title);
+        }
+        await ctx.answerCallbackQuery();
+      } else if (data === 'edit_channel_link') {
+        const channelIdStr = await this.redisService.get(
+          `temp_edit_channel:${userId}`,
+        );
+        if (channelIdStr) {
+          await this.redisService.set(
+            `state:${userId}`,
+            'WAITING_EDIT_CHANNEL_LINK',
+          );
+          await ctx.reply(MESSAGES.ask_new_channel_link);
+        }
+        await ctx.answerCallbackQuery();
+      } else if (data === 'delete_channel') {
+        const channelIdStr = await this.redisService.get(
+          `temp_edit_channel:${userId}`,
+        );
+        if (channelIdStr) {
+          await this.channelsService.delete(parseInt(channelIdStr));
+          await ctx.reply(MESSAGES.channel_deleted);
+          await this.redisService.del(`temp_edit_channel:${userId}`);
+          await this.sendAdminPanel(ctx);
+        }
+        await ctx.answerCallbackQuery();
+      } else if (data === 'edit_movie_title') {
+        const movieIdStr = await this.redisService.get(
+          `temp_edit_movie:${userId}`,
+        );
+        if (movieIdStr) {
+          await this.redisService.set(
+            `state:${userId}`,
+            'WAITING_EDIT_MOVIE_TITLE',
+          );
+          await ctx.reply(MESSAGES.ask_new_movie_title);
+        }
+        await ctx.answerCallbackQuery();
+      } else if (data === 'delete_movie') {
+        const movieIdStr = await this.redisService.get(
+          `temp_edit_movie:${userId}`,
+        );
+        if (movieIdStr) {
+          await this.moviesService.delete(parseInt(movieIdStr));
+          await ctx.reply(MESSAGES.movie_deleted);
+          await this.redisService.del(`temp_edit_movie:${userId}`);
+          await this.sendAdminPanel(ctx);
+        }
+        await ctx.answerCallbackQuery();
+      } else if (data.startsWith('set_movie_category_')) {
+        const categoryIdStr = data.split('_')[3];
+        const fileId = await this.redisService.get(
+          `temp_movie_file_id:${userId}`,
+        );
+        const title = await this.redisService.get(`temp_movie_title:${userId}`);
+
+        if (!fileId || !title) {
+          await ctx.answerCallbackQuery(MESSAGES.session_expired);
+          await this.redisService.set(`state:${userId}`, 'IDLE');
+          return;
+        }
+
+        const code = Math.floor(1000 + Math.random() * 9000);
+        const movieData: any = { title, fileId, code };
+        if (categoryIdStr !== 'none')
+          movieData.categoryId = parseInt(categoryIdStr);
+
+        await this.moviesService.create(movieData);
+        await ctx.answerCallbackQuery();
+        await ctx.reply(MESSAGES.movie_saved(title, code));
+        await this.redisService.set(`state:${userId}`, 'IDLE');
+        await this.redisService.del(`temp_movie_file_id:${userId}`);
+        await this.redisService.del(`temp_movie_title:${userId}`);
+      } else {
+        return next();
+      }
+    });
 
     this.bot.on('message:text', async (ctx) => {
-      const userId = ctx.from.id;
+      const userId = ctx.from!.id;
       const state = await this.redisService.get(`state:${userId}`);
-
-      // Helper to check admin
-      const isSuperAdmin = this.superAdminIds.includes(userId.toString());
-      // We should check DB role too usually, but for performance maybe stick to cached state or just check DB if critical
-      // For simplicity in message handler, we assume if they are in a WAITING_ADMIN state they have permission (checked before entering state)
-      // modifying this to be safe: check role again if critical action
-      // But let's keep it simple for now.
 
       if (state === 'WAITING_MOVIE_CODE') {
         const text = ctx.message.text;
@@ -867,11 +898,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
         await this.moviesService.addView(BigInt(userId), movie.id);
         const avgRating = await this.moviesService.getAverageRating(movie.id);
-
         const keyboard = new InlineKeyboard();
-        for (let i = 1; i <= 5; i++) {
+        for (let i = 1; i <= 5; i++)
           keyboard.text('⭐️'.repeat(i), `rate_${movie.id}_${i}`).row();
-        }
 
         await ctx.replyWithVideo(movie.fileId, {
           caption:
@@ -887,8 +916,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         await this.movieRequestsService.create(BigInt(userId), title);
         await ctx.reply(MESSAGES.request_received);
         await this.redisService.set(`state:${userId}`, 'IDLE');
-
-        // Notify Admins
         for (const adminId of this.superAdminIds) {
           try {
             await this.bot.api.sendMessage(
@@ -917,7 +944,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       } else if (state === 'WAITING_MOVIE_UPLOAD') {
         await ctx.reply(MESSAGES.ask_movie_file_not_text);
       } else if (state === 'WAITING_CHANNEL_ID') {
-        // ... (existing channel logic)
         try {
           const channelIdText = ctx.message.text;
           if (!/^-?\d+$/.test(channelIdText)) {
@@ -925,16 +951,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             return;
           }
           const channelId = BigInt(channelIdText);
-
           let title = 'New Channel';
           let inviteLink = '';
-
           try {
             const chat = await ctx.api.getChat(Number(channelId));
             title = chat.title || title;
-            inviteLink = chat.invite_link || '';
-            if (chat.username) inviteLink = `https://t.me/${chat.username}`;
-
+            inviteLink =
+              chat.invite_link ||
+              (chat.username ? `https://t.me/${chat.username}` : '');
             if (inviteLink) {
               await this.channelsService.addChannel(
                 channelId,
@@ -946,7 +970,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
               return;
             }
           } catch (e) {}
-
           await this.redisService.set(
             `state:${userId}`,
             'WAITING_CHANNEL_LINK',
@@ -983,26 +1006,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           await ctx.reply(MESSAGES.invalid_code);
           return;
         }
-
         const movie = await this.moviesService.findByCode(code);
         if (!movie) {
           await ctx.reply(MESSAGES.movie_not_found_admin);
           return;
         }
-
         await this.redisService.set(
           `temp_edit_movie:${userId}`,
           movie.id.toString(),
         );
-        await this.redisService.set(`state:${userId}`, 'IDLE'); // Clear state, show menu
-
+        await this.redisService.set(`state:${userId}`, 'IDLE');
         const keyboard = new InlineKeyboard()
           .text(MESSAGES.edit_title_btn, 'edit_movie_title')
           .row()
           .text(MESSAGES.delete_btn, 'delete_movie')
           .row()
           .text(MESSAGES.back, 'admin_manage_movies');
-
         await ctx.reply(MESSAGES.manage_movie_detail(movie.title, movie.code), {
           parse_mode: 'Markdown',
           reply_markup: keyboard,
@@ -1013,19 +1032,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           await ctx.reply(MESSAGES.invalid_id);
           return;
         }
-
         const targetId = BigInt(targetIdText);
         try {
-          // Ensure user exists locally or creating them is tough without more info.
-          // We assume they started the bot.
           const targetUser = await this.usersService.findById(Number(targetId));
-          // Note: findById takes number|bigint in service.
-
           if (!targetUser) {
             await ctx.reply(MESSAGES.user_not_found);
             return;
           }
-
           await this.usersService.setRole(targetId, Role.ADMIN);
           await ctx.reply(MESSAGES.user_promoted(targetId.toString()));
           await this.redisService.set(`state:${userId}`, 'IDLE');
@@ -1079,16 +1092,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           `state:${userId}`,
           'WAITING_MOVIE_CATEGORY',
         );
-
         const categories = await this.moviesService.getAllCategories();
         const keyboard = new InlineKeyboard();
-        categories.forEach((cat) => {
-          keyboard.text(cat.name, `set_movie_category_${cat.id}`).row();
-        });
+        categories.forEach((cat) =>
+          keyboard.text(cat.name, `set_movie_category_${cat.id}`).row(),
+        );
         keyboard
           .text(MESSAGES.skip_category_btn, 'set_movie_category_none')
           .row();
-
         await ctx.reply(MESSAGES.ask_movie_category, {
           reply_markup: keyboard,
         });
@@ -1096,73 +1107,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.on('message:video', async (ctx) => {
-      const userId = ctx.from.id;
+      const userId = ctx.from!.id;
       const state = await this.redisService.get(`state:${userId}`);
-
       if (state === 'WAITING_MOVIE_UPLOAD') {
-        const video = ctx.message.video;
         await this.redisService.set(
           `temp_movie_file_id:${userId}`,
-          video.file_id,
+          ctx.message.video.file_id,
         );
         await this.redisService.set(`state:${userId}`, 'WAITING_MOVIE_TITLE');
         await ctx.reply(MESSAGES.ask_new_movie_title);
       }
     });
-
-    this.bot.on('callback_query:data', async (ctx, next) => {
-      const userId = ctx.from!.id;
-      const data = ctx.callbackQuery.data;
-
-      if (data.startsWith('set_movie_category_')) {
-        const categoryIdStr = data.split('_')[3];
-        const fileId = await this.redisService.get(
-          `temp_movie_file_id:${userId}`,
-        );
-        const title = await this.redisService.get(`temp_movie_title:${userId}`);
-
-        if (!fileId || !title) {
-          await ctx.answerCallbackQuery(MESSAGES.session_expired);
-          await this.redisService.set(`state:${userId}`, 'IDLE');
-          return;
-        }
-
-        const code = Math.floor(1000 + Math.random() * 9000);
-        const movieData: any = {
-          title: title,
-          fileId: fileId,
-          code: code,
-        };
-
-        if (categoryIdStr !== 'none') {
-          movieData.categoryId = parseInt(categoryIdStr);
-        }
-
-        await this.moviesService.create(movieData);
-        await ctx.answerCallbackQuery();
-        await ctx.reply(MESSAGES.movie_saved(title, code));
-        await this.redisService.set(`state:${userId}`, 'IDLE');
-        await this.redisService.del(`temp_movie_file_id:${userId}`);
-        await this.redisService.del(`temp_movie_title:${userId}`);
-      } else {
-        return next();
-      }
-    });
-
-    // Start
-    this.bot
-      .start({
-        onStart: (bot) => this.logger.log(`Bot started as @${bot.username}`),
-      })
-      .catch((err) => this.logger.error('Bot failed to start', err));
-  }
-
-  async onModuleDestroy() {
-    await this.bot.stop();
-  }
-
-  getBot(): Bot<Context> {
-    return this.bot;
   }
 
   private async sendAdminPanel(ctx: Context, isEdit = false) {
