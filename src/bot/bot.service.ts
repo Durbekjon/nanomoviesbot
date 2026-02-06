@@ -23,6 +23,7 @@ import { Channel, Role } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MESSAGES } from './messages';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 @Injectable()
 export class BotService implements OnModuleInit, OnModuleDestroy {
@@ -43,10 +44,25 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     if (!token) {
       throw new Error('BOT_TOKEN environment variable is not defined');
     }
-    this.bot = new Bot(token);
-
     const adminIdsStr = this.configService.get<string>('SUPERADMIN_IDS') || '';
     this.superAdminIds = adminIdsStr.split(',').map((id) => id.trim());
+
+    // Proxy support
+    const proxyUrl = this.configService.get<string>('PROXY_URL');
+    if (proxyUrl) {
+      this.logger.log(`Using Proxy: ${proxyUrl}`);
+      const agent = new HttpsProxyAgent(proxyUrl);
+      this.bot = new Bot(token, {
+        client: {
+          baseFetchConfig: {
+            agent,
+            compress: true,
+          },
+        },
+      });
+    } else {
+      this.bot = new Bot(token);
+    }
   }
 
   async onModuleInit() {
@@ -58,11 +74,23 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.registerUserHandlers();
     this.registerStateHandlers();
 
+    // Check connection first
+    try {
+      this.logger.log('Checking Telegram connection...');
+      const me = await this.bot.api.getMe();
+      this.logger.log(`Connection successful. Bot info: @${me.username} (${me.id})`);
+    } catch (e) {
+      this.logger.error('Failed to connect to Telegram API:', e);
+      return;
+    }
+
     // Start
+    this.logger.log('Calling bot.start()...');
     this.bot
       .start({
         onStart: (bot) => this.logger.log(`Bot started as @${bot.username}`),
       })
+      .then(() => this.logger.log('Bot stopped'))
       .catch((err) => this.logger.error('Bot failed to start', err));
   }
 
@@ -113,6 +141,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.use(async (ctx, next) => {
       if (!ctx.from) return next();
       const userId = ctx.from.id;
+      this.logger.debug(`Processing update from ${userId}`);
 
       if (this.superAdminIds.includes(userId.toString())) return next();
 
@@ -779,6 +808,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         );
 
         const keyboard = new InlineKeyboard()
+          .text(
+            channel.isMain ? '✅ Asosiy Kanal' : '⭐ Asosiy qilish',
+            `set_main_channel_${channel.id}`,
+          )
+          .row()
           .text(MESSAGES.edit_title_btn, 'edit_channel_title')
           .text(MESSAGES.edit_link_btn, 'edit_channel_link')
           .row()
@@ -791,7 +825,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           channel.channelId.toString(),
           channel.inviteLink,
         );
-        await this.safeEditMessage(ctx, text, keyboard);
+        // Append Main status to text
+        const detailText = text + (channel.isMain ? '\n\n⭐ *Bu Asosiy Kanal*' : '');
+        
+        await this.safeEditMessage(ctx, detailText, keyboard);
         await ctx.answerCallbackQuery();
       } else if (data === 'edit_channel_title') {
         const channelIdStr = await this.redisService.get(
@@ -828,6 +865,48 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           await this.sendAdminPanel(ctx);
         }
         await ctx.answerCallbackQuery();
+      } else if (data.startsWith('set_main_channel_')) {
+        const channelId = parseInt(data.replace('set_main_channel_', ''));
+        const channel = await this.channelsService.findById(channelId);
+        if (channel) {
+          if (!channel.isMain) {
+            await this.channelsService.setMainChannel(channelId);
+            await ctx.answerCallbackQuery('✅ Kanal Asosiy qilib belgilandi!');
+          } else {
+            await ctx.answerCallbackQuery('⚠️ Bu kanal allaqachon Asosiy.');
+          }
+          
+          const updatedChannel = await this.channelsService.findById(channelId);
+          if (updatedChannel) {
+             const keyboard = new InlineKeyboard()
+              .text(
+                updatedChannel.isMain ? '✅ Asosiy Kanal' : '⭐ Asosiy qilish',
+                `set_main_channel_${updatedChannel.id}`,
+              )
+              .row()
+              .text(MESSAGES.edit_title_btn, 'edit_channel_title')
+              .text(MESSAGES.edit_link_btn, 'edit_channel_link')
+              .row()
+              .text(MESSAGES.delete_channel_btn, 'delete_channel')
+              .row()
+              .text(MESSAGES.back, 'admin_manage_channels');
+
+              const text = MESSAGES.channel_detail(
+                updatedChannel.title,
+                updatedChannel.channelId.toString(),
+                updatedChannel.inviteLink,
+              ) + (updatedChannel.isMain ? '\n\n⭐ *Bu Asosiy Kanal*' : '');
+              
+              try {
+                await ctx.editMessageText(text, {
+                  parse_mode: 'Markdown',
+                  reply_markup: keyboard,
+                });
+              } catch (e) {}
+          }
+        } else {
+           await ctx.answerCallbackQuery('Channel not found');
+        }
       } else if (data === 'edit_movie_title') {
         const movieIdStr = await this.redisService.get(
           `temp_edit_movie:${userId}`,
@@ -1110,12 +1189,84 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       const userId = ctx.from!.id;
       const state = await this.redisService.get(`state:${userId}`);
       if (state === 'WAITING_MOVIE_UPLOAD') {
-        await this.redisService.set(
-          `temp_movie_file_id:${userId}`,
-          ctx.message.video.file_id,
-        );
-        await this.redisService.set(`state:${userId}`, 'WAITING_MOVIE_TITLE');
-        await ctx.reply(MESSAGES.ask_new_movie_title);
+        const caption = ctx.message.caption || '';
+        const match = caption.match(MESSAGES.MOVIE_TEMPLATE.captionRegex);
+
+        if (match) {
+          // 1. Parsing Success - Automatic Flow
+          const [
+            ,
+            title,
+            country,
+            genre,
+            quality,
+            language,
+            description,
+          ] = match;
+
+          // Generate code
+          let code: number;
+          while (true) {
+            code = Math.floor(10000 + Math.random() * 90000);
+            const exists = await this.moviesService.findByCode(code);
+            if (!exists) break;
+          }
+
+          // Create Movie
+          const movie = await this.moviesService.create({
+            title: title.trim(),
+            code,
+            fileId: ctx.message.video.file_id,
+            country: country.trim(),
+            genre: genre.trim(),
+            quality: quality.trim(),
+            language: language.trim(),
+            description: description.trim(),
+          });
+
+          // Confirm to Admin
+          await ctx.reply(MESSAGES.MOVIE_TEMPLATE.adminConfirmation(movie), {
+            parse_mode: 'Markdown',
+          });
+          await this.redisService.del(`state:${userId}`);
+
+          // 2. Auto-Post to Main Channel
+          const mainChannel = await this.channelsService.getMainChannel();
+          if (mainChannel) {
+            try {
+              // Generate Hashtags
+              const clean = (s: string) => s.replace(/[^a-zA-Z0-9]/g, '');
+              const hashtags = `#${clean(movie.genre || '')} #${clean(
+                movie.country || '',
+              )} #${clean(movie.quality || '')} #kino`;
+
+              const channelCaption = MESSAGES.MOVIE_TEMPLATE.channelPost(
+                movie,
+                hashtags,
+              );
+              
+              const watchUrl = `https://t.me/${ctx.me.username}?start=movie_${movie.code}`;
+
+              await ctx.api.sendVideo(Number(mainChannel.channelId), movie.fileId, {
+                caption: channelCaption,
+                parse_mode: 'Markdown',
+                reply_markup: new InlineKeyboard().url('🎬 Tomosha qilish', watchUrl),
+              });
+              await ctx.reply(`✅ Posted to Main Channel: ${mainChannel.title}`);
+            } catch (e) {
+              await ctx.reply(`⚠️ Failed to auto-post: ${e}`);
+            }
+          }
+
+        } else {
+          // 3. Fallback - Manual Flow
+          await this.redisService.set(
+            `temp_movie_file_id:${userId}`,
+            ctx.message.video.file_id,
+          );
+          await this.redisService.set(`state:${userId}`, 'WAITING_MOVIE_TITLE');
+          await ctx.reply(MESSAGES.ask_new_movie_title);
+        }
       }
     });
   }

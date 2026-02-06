@@ -58,7 +58,29 @@ export class ChannelsService {
 
   async delete(id: number) {
     const channel = await this.prisma.channel.delete({ where: { id } });
-    await this.redisService.del(this.CACHE_KEY);
     return channel;
+  }
+
+  async setMainChannel(channelId: number): Promise<void> {
+    await this.prisma.$transaction([
+      this.prisma.channel.updateMany({
+        where: { isMain: true },
+        data: { isMain: false },
+      }),
+      this.prisma.channel.update({
+        where: { id: channelId },
+        data: { isMain: true },
+      }),
+    ]);
+    await this.redisService.del(this.CACHE_KEY);
+  }
+
+  async getMainChannel(): Promise<Channel | null> {
+    // Only fetch main channel info, not cached with 'all' usually, but ok.
+    // For simplicity, we can fetch directly or filter form cache.
+    // Let's fetch directly to be sure.
+    return this.prisma.channel.findFirst({
+      where: { isMain: true },
+    });
   }
 }

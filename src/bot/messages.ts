@@ -32,6 +32,49 @@ export const MESSAGES = {
   movie_caption_with_code: (title: string, code: number) =>
     `🎬 *${title}* (Kod: \`${code}\`)`,
 
+  
+  // Parsing & Templates
+  /*
+  "🎬 Kino nomi: {NOMI}  
+  🌍 Davlat: {DAVLAT}  
+  🔥 Janr: {JANR}  
+  🎥 Sifat: {SIFAT}  
+  🗣 Til: {TIL}
+
+  📖 Tavsif:
+  {TAFSIF}"
+  */
+  MOVIE_TEMPLATE: {
+    captionRegex: /🎬 (?:Kino nomi|Name|Nomi):?\s*(.+)\s+(?:🌍|🌏|🌎) (?:Davlat|Country):?\s*(.+)\s+🔥 (?:Janr|Genre):?\s*(.+)\s+🎥 (?:Sifat|Quality):?\s*(.+)\s+(?:🗣|🔊) (?:Til|Language):?\s*(.+)\s+📖 (?:Tavsif|Description):?\s*([\s\S]+)/i,
+    
+    adminConfirmation: (m: any) => `
+🎬 *Kino nomi*: ${m.title}
+🌍 *Davlat*: ${m.country}
+🔥 *Janr*: ${m.genre}
+🎥 *Sifat*: ${m.quality}
+🗣 *Til*: ${m.language}
+
+📖 *Tavsif*:
+${m.description}
+
+🔑 *Kino kodi*: \`${m.code}\`
+
+👇 *To‘liq filmni shu yerdan tomosha qiling*:
+https://t.me/nanomoviesuz_bot?start=movie_${m.code}
+
+📢 *Kanalimizga obuna bo‘ling*:
+👉 https://t.me/nanomoviesuz
+`,
+
+    channelPost: (m: any, hashtags: string) => `
+🎬 *${m.title}*
+
+${m.description}
+
+${hashtags}
+`,
+  },
+
   // Feedback
   ask_feedback: 'Iltimos, fikr-mulohazangizni yoki savolingizni yuboring:',
   feedback_sent: '✅ Fikr-mulohaza yuborildi!',
