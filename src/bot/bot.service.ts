@@ -78,7 +78,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     try {
       this.logger.log('Checking Telegram connection...');
       const me = await this.bot.api.getMe();
-      this.logger.log(`Connection successful. Bot info: @${me.username} (${me.id})`);
+      this.logger.log(
+        `Connection successful. Bot info: @${me.username} (${me.id})`,
+      );
     } catch (e) {
       this.logger.error('Failed to connect to Telegram API:', e);
       return;
@@ -142,6 +144,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       if (!ctx.from) return next();
       const userId = ctx.from.id;
       this.logger.debug(`Processing update from ${userId}`);
+
+      if (ctx.message?.text?.startsWith('/start')) {
+        const { id, first_name, username } = ctx.from;
+        const match = ctx.message.text.split(' ')[1];
+        await this.usersService.createOrUpdate({
+          id: BigInt(id),
+          firstName: first_name,
+          username: username,
+          referralSource: match,
+        });
+      }
 
       if (this.superAdminIds.includes(userId.toString())) return next();
 
@@ -212,7 +225,25 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         try {
           await ctx.deleteMessage();
         } catch (e) {}
-        await ctx.reply(MESSAGES.welcome_back);
+
+        const { id, first_name, username } = ctx.from;
+        await this.usersService.createOrUpdate({
+          id: BigInt(id),
+          firstName: first_name,
+          username: username,
+        });
+
+        await this.redisService.set(`state:${id}`, 'WAITING_MOVIE_CODE');
+        const logoPath = path.join(
+          __dirname,
+          '..',
+          '..',
+          'static',
+          'logo2.png',
+        );
+        await ctx.replyWithPhoto(new InputFile(logoPath), {
+          caption: `${MESSAGES.welcome(first_name)}\n\n${MESSAGES.ask_movie_code}`,
+        });
         return;
       }
 
@@ -261,25 +292,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         referralSource: referralSource,
       });
 
-      await this.redisService.set(`state:${id}`, 'IDLE');
-
       if (ctx.match?.startsWith('movie_')) {
         const code = parseInt(ctx.match.split('_')[1]);
         const movie = await this.moviesService.findByCode(code);
         if (movie) {
           await this.moviesService.addView(BigInt(id), movie.id);
-          const avgRating = await this.moviesService.getAverageRating(movie.id);
-          const keyboard = new InlineKeyboard();
-          for (let i = 1; i <= 5; i++) {
-            keyboard.text('⭐️'.repeat(i), `rate_${movie.id}_${i}`).row();
-          }
           await ctx.replyWithVideo(movie.fileId, {
-            caption:
-              MESSAGES.movie_caption_with_code(movie.title, movie.code) +
-              `\n\n` +
-              MESSAGES.average_rating(avgRating),
+            caption: MESSAGES.movie_caption_with_code(movie.title, movie.code),
             parse_mode: 'Markdown',
-            reply_markup: keyboard,
           });
           return;
         }
@@ -292,22 +312,15 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         isSuperAdmin;
 
       if (isAdmin) {
+        await this.redisService.set(`state:${id}`, 'IDLE');
         await this.sendAdminPanel(ctx);
         return;
       }
 
-      const keyboard = new InlineKeyboard()
-        .text(MESSAGES.search_movie_btn, 'search_movie')
-        .row()
-        .text(MESSAGES.random_movie_btn, 'random_movie')
-        .row()
-        .text(MESSAGES.contact_feedback_btn, 'feedback')
-        .row();
-
-      const logoPath = path.join(__dirname, '..', '..', 'static', 'logo.png');
+      await this.redisService.set(`state:${id}`, 'WAITING_MOVIE_CODE');
+      const logoPath = path.join(__dirname, '..', '..', 'static', 'logo2.png');
       await ctx.replyWithPhoto(new InputFile(logoPath), {
-        caption: MESSAGES.welcome(first_name),
-        reply_markup: keyboard,
+        caption: `${MESSAGES.welcome(first_name)}\n\n${MESSAGES.ask_movie_code}`,
       });
     });
   }
@@ -318,22 +331,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.callbackQuery('user_mode', async (ctx) => {
-      const keyboard = new InlineKeyboard()
-        .text(MESSAGES.search_movie_btn, 'search_movie')
-        .text(MESSAGES.categories_btn, 'categories')
-        .row()
-        .text(MESSAGES.trending_btn, 'trending')
-        .text(MESSAGES.random_movie_btn, 'random_movie')
-        .row()
-        .text(MESSAGES.request_movie_btn, 'request_movie')
-        .text(MESSAGES.contact_feedback_btn, 'feedback')
-        .row()
-        .text(MESSAGES.admin_panel_btn, 'admin_panel');
-
-      const logoPath = path.join(__dirname, '..', '..', 'static', 'logo.png');
+      await this.redisService.set(
+        `state:${ctx.from!.id}`,
+        'WAITING_MOVIE_CODE',
+      );
+      const logoPath = path.join(__dirname, '..', '..', 'static', 'logo2.png');
       await ctx.replyWithPhoto(new InputFile(logoPath), {
-        caption: MESSAGES.welcome_user_mode(ctx.from!.first_name),
-        reply_markup: keyboard,
+        caption: `${MESSAGES.welcome_user_mode(ctx.from!.first_name)}\n\n${MESSAGES.ask_movie_code}`,
       });
       await ctx.answerCallbackQuery();
     });
@@ -826,8 +830,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           channel.inviteLink,
         );
         // Append Main status to text
-        const detailText = text + (channel.isMain ? '\n\n⭐ *Bu Asosiy Kanal*' : '');
-        
+        const detailText =
+          text + (channel.isMain ? '\n\n⭐ *Bu Asosiy Kanal*' : '');
+
         await this.safeEditMessage(ctx, detailText, keyboard);
         await ctx.answerCallbackQuery();
       } else if (data === 'edit_channel_title') {
@@ -875,10 +880,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           } else {
             await ctx.answerCallbackQuery('⚠️ Bu kanal allaqachon Asosiy.');
           }
-          
+
           const updatedChannel = await this.channelsService.findById(channelId);
           if (updatedChannel) {
-             const keyboard = new InlineKeyboard()
+            const keyboard = new InlineKeyboard()
               .text(
                 updatedChannel.isMain ? '✅ Asosiy Kanal' : '⭐ Asosiy qilish',
                 `set_main_channel_${updatedChannel.id}`,
@@ -891,21 +896,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
               .row()
               .text(MESSAGES.back, 'admin_manage_channels');
 
-              const text = MESSAGES.channel_detail(
+            const text =
+              MESSAGES.channel_detail(
                 updatedChannel.title,
                 updatedChannel.channelId.toString(),
                 updatedChannel.inviteLink,
               ) + (updatedChannel.isMain ? '\n\n⭐ *Bu Asosiy Kanal*' : '');
-              
-              try {
-                await ctx.editMessageText(text, {
-                  parse_mode: 'Markdown',
-                  reply_markup: keyboard,
-                });
-              } catch (e) {}
+
+            try {
+              await ctx.editMessageText(text, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard,
+              });
+            } catch (e) {}
           }
         } else {
-           await ctx.answerCallbackQuery('Channel not found');
+          await ctx.answerCallbackQuery('Channel not found');
         }
       } else if (data === 'edit_movie_title') {
         const movieIdStr = await this.redisService.get(
@@ -963,7 +969,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       const userId = ctx.from!.id;
       const state = await this.redisService.get(`state:${userId}`);
 
-      if (state === 'WAITING_MOVIE_CODE') {
+      if (
+        state === 'WAITING_MOVIE_CODE' ||
+        (!state && /^\d+$/.test(ctx.message.text)) ||
+        (state === 'IDLE' && /^\d+$/.test(ctx.message.text))
+      ) {
         const text = ctx.message.text;
         const code = parseInt(text, 10);
         if (isNaN(code)) {
@@ -976,20 +986,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           return;
         }
         await this.moviesService.addView(BigInt(userId), movie.id);
-        const avgRating = await this.moviesService.getAverageRating(movie.id);
-        const keyboard = new InlineKeyboard();
-        for (let i = 1; i <= 5; i++)
-          keyboard.text('⭐️'.repeat(i), `rate_${movie.id}_${i}`).row();
 
         await ctx.replyWithVideo(movie.fileId, {
-          caption:
-            MESSAGES.movie_caption(movie.title) +
-            `\n\n` +
-            MESSAGES.average_rating(avgRating),
+          caption: MESSAGES.movie_caption_with_code(movie.title, movie.code),
           parse_mode: 'Markdown',
-          reply_markup: keyboard,
         });
-        await this.redisService.set(`state:${userId}`, 'IDLE');
+
+        await this.redisService.set(`state:${userId}`, 'WAITING_MOVIE_CODE');
       } else if (state === 'WAITING_REQUEST_TITLE') {
         const title = ctx.message.text;
         await this.movieRequestsService.create(BigInt(userId), title);
@@ -1194,15 +1197,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         if (match) {
           // 1. Parsing Success - Automatic Flow
-          const [
-            ,
-            title,
-            country,
-            genre,
-            quality,
-            language,
-            description,
-          ] = match;
+          const [, title, country, genre, quality, language, description] =
+            match;
 
           // Generate code
           let code: number;
@@ -1244,20 +1240,28 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 movie,
                 hashtags,
               );
-              
+
               const watchUrl = `https://t.me/${ctx.me.username}?start=movie_${movie.code}`;
 
-              await ctx.api.sendVideo(Number(mainChannel.channelId), movie.fileId, {
-                caption: channelCaption,
-                parse_mode: 'Markdown',
-                reply_markup: new InlineKeyboard().url('🎬 Tomosha qilish', watchUrl),
-              });
-              await ctx.reply(`✅ Posted to Main Channel: ${mainChannel.title}`);
+              await ctx.api.sendVideo(
+                Number(mainChannel.channelId),
+                movie.fileId,
+                {
+                  caption: channelCaption,
+                  parse_mode: 'Markdown',
+                  reply_markup: new InlineKeyboard().url(
+                    '🎬 Tomosha qilish',
+                    watchUrl,
+                  ),
+                },
+              );
+              await ctx.reply(
+                `✅ Posted to Main Channel: ${mainChannel.title}`,
+              );
             } catch (e) {
               await ctx.reply(`⚠️ Failed to auto-post: ${e}`);
             }
           }
-
         } else {
           // 3. Fallback - Manual Flow
           await this.redisService.set(
