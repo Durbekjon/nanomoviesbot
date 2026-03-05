@@ -163,10 +163,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         return next();
       }
 
-      const cacheKey = `sub_status:${userId}`;
-      const isSubscribedCached = await this.redisService.get(cacheKey);
-      if (isSubscribedCached === 'true') return next();
-
       const channels = await this.channelsService.findAll();
       const notSubscribed: Channel[] = [];
 
@@ -214,8 +210,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
         return;
       }
-
-      await this.redisService.set(cacheKey, 'true', 300);
 
       if (
         ctx.callbackQuery &&
